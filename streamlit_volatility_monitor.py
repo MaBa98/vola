@@ -5,7 +5,9 @@ import numpy as np
 import yfinance as yf
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from scipy import stats
 
 st.set_page_config(page_title="Volatility Monitor", layout="wide")
 
@@ -96,6 +98,50 @@ def compute_volatility(df, window):
 
 def get_percentile(val, series):
     return np.sum(series <= val) / len(series) * 100
+
+def calculate_price_confidence_interval(df, confidence_level=0.95, days_ahead=30):
+    """
+    Calcola l'intervallo di confidenza del prezzo dell'azione per un periodo futuro
+    basato sulla distribuzione dei rendimenti storici
+    """
+    # Calcola i rendimenti logaritmici giornalieri
+    log_returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
+    
+    # Statistiche dei rendimenti
+    mean_return = float(log_returns.mean())
+    std_return = float(log_returns.std())
+    
+    # Prezzo corrente
+    current_price = float(df["Close"].iloc[-1])
+    
+    # Calcola rendimento atteso e volatilità per il periodo
+    expected_return = mean_return * days_ahead
+    volatility_period = std_return * np.sqrt(days_ahead)
+    
+    # Calcola i percentili per l'intervallo di confidenza
+    alpha = 1 - confidence_level
+    lower_percentile = alpha / 2
+    upper_percentile = 1 - alpha / 2
+    
+    # Calcola i bounds usando la distribuzione normale
+    z_lower = stats.norm.ppf(lower_percentile)
+    z_upper = stats.norm.ppf(upper_percentile)
+    
+    # Calcola i prezzi bounds
+    lower_bound = current_price * np.exp(expected_return + z_lower * volatility_period)
+    upper_bound = current_price * np.exp(expected_return + z_upper * volatility_period)
+    expected_price = current_price * np.exp(expected_return)
+    
+    return {
+        'current_price': current_price,
+        'expected_price': float(expected_price),
+        'lower_bound': float(lower_bound),
+        'upper_bound': float(upper_bound),
+        'mean_return': mean_return,
+        'std_return': std_return,
+        'days_ahead': days_ahead,
+        'confidence_level': confidence_level
+    }
 
 def display_revenue_earnings(symbol):
     """
@@ -432,6 +478,7 @@ if not st.session_state.tickers:
 tab1, tab2 = st.tabs(["📊 Overview", "🔎 Single Stock Detail"])
 
 vol_data = {}
+price_data = {}
 summary_data = []
 correlation_df = pd.DataFrame()
 chart_data = []
@@ -444,6 +491,7 @@ for ticker in st.session_state.tickers:
 
     vol = compute_volatility(df, st.session_state.window)
     vol_data[ticker] = vol
+    price_data[ticker] = df
 
     if not vol.dropna().empty:
         chart_data.append(go.Scatter(x=vol.dropna().index, y=vol.dropna().values, mode='lines', name=ticker))
@@ -517,20 +565,118 @@ with tab2:
     
     if selected_detail:
         vol = vol_data.get(selected_detail)
-        if vol is not None and not vol.dropna().empty:
-            # Grafici volatilità esistenti
+        df = price_data.get(selected_detail)
+        
+        if vol is not None and df is not None and not vol.dropna().empty:
+            # Slider per l'ampiezza dell'intervallo di confidenza
+            confidence_level_input = st.slider(
+                "Seleziona Livello di Confidenza per Previsione Prezzo (entro 30gg)",
+                min_value=0.70, 
+                max_value=0.99, 
+                value=0.95, 
+                step=0.01,
+                format="%.2f"
+            )
+            
+            # Prezzo corrente e intervallo di confidenza
+            current_price = float(df["Close"].iloc[-1])
+            confidence_data = calculate_price_confidence_interval(df, confidence_level=confidence_level_input)
+            
+            # Visualizza prezzo corrente e previsioni
+            st.subheader(f"💰 Analisi Prezzo - {selected_detail}")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("💵 Prezzo Attuale", f"${current_price:.2f}")
+            with col2:
+                expected_change = ((confidence_data['expected_price'] - current_price) / current_price) * 100
+                st.metric("📈 Prezzo Atteso (30gg)", f"${confidence_data['expected_price']:.2f}", 
+                         f"{expected_change:+.1f}%")
+            with col3:
+                lower_change = ((confidence_data['lower_bound'] - current_price) / current_price) * 100
+                st.metric(f"📉 Limite Inf. ({int(confidence_level_input*100)}%)", f"${confidence_data['lower_bound']:.2f}",
+                         f"{lower_change:+.1f}%")
+            with col4:
+                upper_change = ((confidence_data['upper_bound'] - current_price) / current_price) * 100
+                st.metric(f"📊 Limite Sup. ({int(confidence_level_input*100)}%)", f"${confidence_data['upper_bound']:.2f}",
+                         f"{upper_change:+.1f}%")
+            
+            # Avviso sull'intervallo di confidenza
+            st.info(f"📊 **Intervallo di Confidenza al {int(confidence_level_input*100)}% per i prossimi 30 giorni:** "
+                   f"Il prezzo di {selected_detail} ha il {int(confidence_level_input*100)}% di probabilità di trovarsi tra "
+                   f"{confidence_data['lower_bound']:.2f} e {confidence_data['upper_bound']:.2f}")
+            
+            st.subheader(f"📈 Volatilità e Prezzo - {selected_detail}")
+
+            # Create two columns
+            col1, col2 = st.columns(2)
+
+            # Volatility chart
+            with col1:
+                st.markdown("**Volatilità**")
+                fig_vol = go.Figure()
+                fig_vol.add_trace(
+                    go.Scatter(
+                        x=vol.dropna().index,
+                        y=vol.dropna().values,
+                        mode='lines',
+                        line=dict(color='red', width=2)
+                    )
+                )
+                fig_vol.update_layout(
+                    xaxis_title="Data",
+                    yaxis_title="Volatilità",
+                    height=500,
+                    showlegend=False
+                )
+                st.plotly_chart(fig_vol, use_container_width=True)
+
+            # Price chart
+            with col2:
+                st.markdown("**Prezzo**")
+                
+                try:
+                    # Gestione corretta delle colonne MultiIndex
+                    if isinstance(df.columns[0], tuple):
+                        # Se le colonne sono tuple, prendi la prima colonna disponibile
+                        price_column = df.iloc[:, 0]  # Prende la prima colonna indipendentemente dal nome
+                    else:
+                        price_column = df["Close"]
+                    
+                    # Converti a numerico e pulisci
+                    price_data = pd.to_numeric(price_column, errors='coerce')
+                    price_data = price_data.dropna()
+                    
+                    if len(price_data) > 0:
+                        fig_price = go.Figure()
+                        fig_price.add_trace(
+                            go.Scatter(
+                                x=price_data.index,
+                                y=price_data.values,
+                                mode='lines',
+                                line=dict(color='blue', width=2),
+                                name=f'{selected_detail} Price'
+                            )
+                        )
+                        fig_price.update_layout(
+                            xaxis_title="Data",
+                            yaxis_title="Prezzo ($)",
+                            height=500,
+                            showlegend=False,
+                            title=f"Andamento Prezzo - {selected_detail}"
+                        )
+                        st.plotly_chart(fig_price, use_container_width=True)
+                    else:
+                        st.error("❌ Nessun dato valido dopo la pulizia")
+                        
+                except Exception as e:
+                    st.error(f"❌ Errore nella creazione del grafico: {str(e)}")
+
+            
+            # Grafici originali in colonne
             col1, col2 = st.columns(2)
             
             with col1:
-                fig_line = px.line(
-                    x=vol.dropna().index, 
-                    y=vol.dropna().values, 
-                    labels={'x': 'Date', 'y': 'Volatility'}, 
-                    title=f"📈 {selected_detail} Volatility Over Time"
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
-            
-            with col2:
                 fig_hist = px.histogram(
                     vol.dropna(), 
                     nbins=30, 
@@ -538,15 +684,31 @@ with tab2:
                 )
                 st.plotly_chart(fig_hist, use_container_width=True)
             
-            # Box plot
-            fig_box = go.Figure(data=[go.Box(y=vol.dropna().values, name=selected_detail)])
-            fig_box.update_layout(title=f"📦 {selected_detail} Volatility Box Plot")
-            st.plotly_chart(fig_box, use_container_width=True)
+            with col2:
+                # Box plot
+                fig_box = go.Figure(data=[go.Box(y=vol.dropna().values, name=selected_detail)])
+                fig_box.update_layout(title=f"📦 {selected_detail} Volatility Box Plot")
+                st.plotly_chart(fig_box, use_container_width=True)
+            
+            # Statistiche aggiuntive sui rendimenti
+            st.subheader("📊 Statistiche Rendimenti")
+            log_returns = np.log(df["Close"] / df["Close"].shift(1)).dropna()
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("📈 Rendimento Medio Giornaliero", f"{float(log_returns.mean()):.4f}")
+            with col2:
+                st.metric("📊 Volatilità Giornaliera", f"{float(log_returns.std()):.4f}")
+            with col3:
+                st.metric("📉 VaR 95% (1 giorno)", f"{float(np.percentile(log_returns, 5)):.4f}")
+            with col4:
+                sharpe_ratio = float(log_returns.mean()/log_returns.std()*np.sqrt(252))
+                st.metric("📊 Sharpe Ratio (appross.)", f"{sharpe_ratio:.2f}")
             
             # Link Yahoo Finance
             st.markdown(f"[📰 View latest news on Yahoo Finance for {selected_detail}](https://finance.yahoo.com/quote/{selected_detail}/news)")
             
-            # --- NUOVA SEZIONE FINANZIARIA ---
+            # --- SEZIONE FINANZIARIA ORIGINALE ---
             st.markdown("---")
             display_financial_section(selected_detail)
             
